@@ -8,14 +8,11 @@ import streamlit as st
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
 
-MAX_FILE_MB = 25
-MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
-
+MAX_FILE_MB = 200
 DEFAULT_BLOCK_SIZE = 25
 MAX_BLOCK_SIZE = 100
 
-
-st.set_page_config(page_title="PDF OCR por bloques", page_icon="📄", layout="centered")
+st.set_page_config(page_title="PDF OCR", page_icon="📄", layout="centered")
 
 
 def check_tesseract() -> Tuple[bool, str]:
@@ -24,7 +21,7 @@ def check_tesseract() -> Tuple[bool, str]:
         if not tesseract_path:
             return False, "No se encontró Tesseract en el sistema."
         version = pytesseract.get_tesseract_version()
-        return True, f"Tesseract detectado: {version}"
+        return True, f"Tesseract detectado correctamente (versión {version})"
     except Exception as e:
         return False, f"Error verificando Tesseract: {e}"
 
@@ -45,8 +42,7 @@ def render_page(pdf: pdfium.PdfDocument, page_index: int, dpi: int) -> Image.Ima
     scale = dpi / 72.0
     page = pdf[page_index]
     bitmap = page.render(scale=scale)
-    image = bitmap.to_pil().convert("L")
-    return image
+    return bitmap.to_pil().convert("L")
 
 
 def image_to_searchable_pdf_page(image: Image.Image, lang: str) -> bytes:
@@ -91,11 +87,10 @@ def process_block(
         pct = int(((page_idx + 1) / total_pages) * 100)
         progress_bar.progress(
             pct,
-            text=f"Procesando página {page_idx + 1}/{total_pages}"
+            text=f"Procesando página {page_idx + 1} de {total_pages}"
         )
         status_box.info(
-            f"Bloque actual: páginas {start_page + 1}-{end_page} | "
-            f"Página {page_idx + 1} de {total_pages}"
+            f"Procesando bloque: páginas {start_page + 1} a {end_page}"
         )
 
     return merge_pdf_bytes_list(block_page_pdfs)
@@ -127,15 +122,15 @@ def process_large_pdf_in_blocks(
         )
         merged_blocks.append(block_pdf)
 
-    status_box.info("Uniendo bloques finales...")
+    status_box.info("Uniendo todas las partes del PDF...")
     final_pdf = merge_pdf_bytes_list(merged_blocks)
     progress_bar.progress(100, text="Proceso terminado")
     return final_pdf
 
 
 def main():
-    st.title("📄 PDF OCR robusto por bloques")
-    st.write("Sube un PDF y genera un PDF OCR searchable por partes, pensado para archivos grandes.")
+    st.title("📄 Convertir PDF a PDF con OCR")
+    st.write("Sube un archivo PDF para convertirlo en un PDF con texto reconocible y buscable.")
 
     ok, msg = check_tesseract()
     if not ok:
@@ -143,56 +138,92 @@ def main():
         st.stop()
     st.success(msg)
 
+    st.markdown("### 1) Configuración")
+
     langs = available_languages()
-    lang_options = []
+    lang_map = {}
 
     if "spa" in langs and "eng" in langs:
-        lang_options.append("spa+eng")
+        lang_map["Español + Inglés"] = "spa+eng"
     if "spa" in langs:
-        lang_options.append("spa")
+        lang_map["Solo Español"] = "spa"
     if "eng" in langs:
-        lang_options.append("eng")
+        lang_map["Solo Inglés"] = "eng"
 
-    if not lang_options:
+    if not lang_map:
         st.error("No hay idiomas OCR disponibles.")
         st.stop()
 
-    selected_lang = st.selectbox("Idioma OCR", lang_options, index=0)
+    selected_lang_label = st.selectbox(
+        "Idioma del documento",
+        list(lang_map.keys()),
+        help="Elige el idioma principal del PDF para mejorar el reconocimiento."
+    )
+    selected_lang = lang_map[selected_lang_label]
 
-    dpi = st.selectbox("Calidad / DPI", [100, 120, 140, 150], index=1)
-    block_size = st.slider("Páginas por bloque", min_value=5, max_value=MAX_BLOCK_SIZE, value=DEFAULT_BLOCK_SIZE, step=5)
+    quality_map = {
+        "Baja (archivo más liviano)": 100,
+        "Media (recomendado)": 120,
+        "Alta (mejor lectura, más peso)": 140,
+        "Muy alta (más pesado)": 150,
+    }
 
-    uploaded_file = st.file_uploader("Sube tu PDF", type=["pdf"])
+    selected_quality_label = st.selectbox(
+        "Calidad del resultado",
+        list(quality_map.keys()),
+        index=1,
+        help="Mayor calidad puede aumentar el tamaño final del PDF."
+    )
+    dpi = quality_map[selected_quality_label]
+
+    block_size = st.slider(
+        "Páginas procesadas por bloque",
+        min_value=5,
+        max_value=MAX_BLOCK_SIZE,
+        value=DEFAULT_BLOCK_SIZE,
+        step=5,
+        help="Para PDFs grandes, usar bloques pequeños ayuda a que no falle el proceso."
+    )
+
+    st.info(
+        "Recomendación: si tu PDF es muy grande, usa calidad media o baja y bloques de 10 a 25 páginas."
+    )
+
+    st.markdown("### 2) Subir archivo")
+
+    uploaded_file = st.file_uploader(
+        "Selecciona tu PDF",
+        type=["pdf"],
+        help=f"Tamaño máximo de subida: {MAX_FILE_MB} MB"
+    )
 
     if uploaded_file is None:
-        st.info("Esperando archivo PDF.")
+        st.warning("Aún no has subido ningún archivo PDF.")
         return
 
     pdf_bytes = uploaded_file.read()
     input_size_mb = len(pdf_bytes) / (1024 * 1024)
 
-    st.write(f"**Archivo:** {uploaded_file.name}")
-    st.write(f"**Tamaño original:** {input_size_mb:.2f} MB")
+    st.markdown("### 3) Resumen del archivo")
+    st.write(f"**Nombre:** {uploaded_file.name}")
+    st.write(f"**Tamaño:** {input_size_mb:.2f} MB")
 
     try:
         total_pages = get_page_count(pdf_bytes)
-        st.write(f"**Páginas detectadas:** {total_pages}")
+        st.write(f"**Cantidad de páginas:** {total_pages}")
     except Exception as e:
         st.error(f"No se pudo leer el PDF: {e}")
         return
 
-    if total_pages == 0:
-        st.error("El PDF no contiene páginas.")
-        return
-
     if total_pages > 1000:
         st.warning(
-            f"El PDF tiene {total_pages} páginas. Se intentará procesar por bloques, "
-            "pero puede tardar bastante en Streamlit Cloud."
+            "Este archivo tiene muchas páginas. Se procesará por partes y puede tardar bastante."
         )
 
-    if st.button("Procesar OCR"):
-        progress_bar = st.progress(0, text="Iniciando proceso...")
+    st.markdown("### 4) Procesar")
+
+    if st.button("Iniciar conversión OCR"):
+        progress_bar = st.progress(0, text="Preparando proceso...")
         status_box = st.empty()
 
         try:
@@ -206,27 +237,22 @@ def main():
             )
 
             output_size_mb = len(output_pdf) / (1024 * 1024)
-            st.write(f"**Tamaño final:** {output_size_mb:.2f} MB")
 
-            if len(output_pdf) <= MAX_FILE_BYTES:
-                st.success("El archivo final quedó dentro del límite de 25 MB.")
-            else:
-                st.warning(
-                    f"El archivo final quedó en {output_size_mb:.2f} MB. "
-                    "Para bajarlo más, usa un DPI menor o bloques más pequeños."
-                )
+            st.markdown("### 5) Resultado")
+            st.success("Conversión terminada correctamente.")
+            st.write(f"**Tamaño final del PDF:** {output_size_mb:.2f} MB")
 
-            out_name = uploaded_file.name.rsplit(".", 1)[0] + "_ocr_bloques.pdf"
+            out_name = uploaded_file.name.rsplit(".", 1)[0] + "_ocr.pdf"
 
             st.download_button(
-                label="Descargar PDF OCR",
+                label="Descargar PDF con OCR",
                 data=output_pdf,
                 file_name=out_name,
                 mime="application/pdf",
             )
 
         except Exception as e:
-            st.error(f"Error procesando el PDF: {e}")
+            st.error(f"Ocurrió un error durante el proceso: {e}")
 
 
 if __name__ == "__main__":
