@@ -10,22 +10,19 @@ from pypdf import PdfReader, PdfWriter
 
 MAX_FILE_MB = 25
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
-MAX_PAGES = 80
 
-DPI_CANDIDATES_COMPACT = [140, 120, 100]
-DPI_CANDIDATES_NORMAL = [170, 150, 130]
+DEFAULT_BLOCK_SIZE = 25
+MAX_BLOCK_SIZE = 100
 
 
-st.set_page_config(page_title="PDF OCR 25MB", page_icon="📄", layout="centered")
+st.set_page_config(page_title="PDF OCR por bloques", page_icon="📄", layout="centered")
 
 
 def check_tesseract() -> Tuple[bool, str]:
-    """Verifica si Tesseract está disponible."""
     try:
         tesseract_path = shutil.which("tesseract")
         if not tesseract_path:
-            return False, "No se encontró el binario 'tesseract' en el sistema."
-
+            return False, "No se encontró Tesseract en el sistema."
         version = pytesseract.get_tesseract_version()
         return True, f"Tesseract detectado: {version}"
     except Exception as e:
@@ -33,155 +30,137 @@ def check_tesseract() -> Tuple[bool, str]:
 
 
 def available_languages() -> List[str]:
-    """Obtiene idiomas disponibles en Tesseract."""
     try:
         return pytesseract.get_languages(config="")
     except Exception:
         return []
 
 
-def render_pdf_pages(pdf_bytes: bytes, dpi: int, grayscale: bool = True) -> List[Image.Image]:
-    """
-    Convierte páginas PDF a imágenes PIL usando pypdfium2.
-    """
+def get_page_count(pdf_bytes: bytes) -> int:
     pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes))
-    page_count = len(pdf)
+    return len(pdf)
 
-    images: List[Image.Image] = []
 
+def render_page(pdf: pdfium.PdfDocument, page_index: int, dpi: int) -> Image.Image:
     scale = dpi / 72.0
-
-    for page_index in range(page_count):
-        page = pdf[page_index]
-        bitmap = page.render(scale=scale)
-        pil_image = bitmap.to_pil()
-
-        if grayscale:
-            pil_image = pil_image.convert("L")
-        else:
-            pil_image = pil_image.convert("RGB")
-
-        images.append(pil_image)
-
-    return images
+    page = pdf[page_index]
+    bitmap = page.render(scale=scale)
+    image = bitmap.to_pil().convert("L")
+    return image
 
 
 def image_to_searchable_pdf_page(image: Image.Image, lang: str) -> bytes:
-    """
-    Convierte una imagen PIL en una página PDF searchable usando Tesseract.
-    """
-    if image.mode not in ("RGB", "L"):
-        image = image.convert("RGB")
-
-    pdf_bytes = pytesseract.image_to_pdf_or_hocr(
+    return pytesseract.image_to_pdf_or_hocr(
         image,
         extension="pdf",
         lang=lang,
     )
-    return pdf_bytes
 
 
-def merge_pdf_pages(pdf_pages: List[bytes]) -> bytes:
-    """
-    Une varias páginas PDF en un solo archivo PDF.
-    """
+def merge_pdf_bytes_list(pdf_parts: List[bytes]) -> bytes:
     writer = PdfWriter()
 
-    for page_pdf in pdf_pages:
-        reader = PdfReader(io.BytesIO(page_pdf))
+    for part in pdf_parts:
+        reader = PdfReader(io.BytesIO(part))
         for page in reader.pages:
             writer.add_page(page)
 
-    output = io.BytesIO()
-    writer.write(output)
-    return output.getvalue()
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
-def build_searchable_pdf(
+def process_block(
     pdf_bytes: bytes,
+    start_page: int,
+    end_page: int,
+    dpi: int,
     lang: str,
-    dpi_candidates: List[int],
+    total_pages: int,
     progress_bar,
     status_box,
-) -> Tuple[bytes, int]:
-    """
-    Intenta generar un PDF OCR searchable usando distintos DPI.
-    Devuelve el primero que quede <= 25 MB. Si ninguno lo logra,
-    devuelve el más pequeño encontrado.
-    """
-    best_pdf = None
-    best_size = None
-    best_dpi = None
-
-    # Solo para saber cantidad de páginas una vez
+) -> bytes:
     pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes))
-    total_pages = len(pdf)
+    block_page_pdfs: List[bytes] = []
 
-    for dpi_try_index, dpi in enumerate(dpi_candidates, start=1):
-        status_box.info(f"Probando con DPI {dpi}...")
+    for page_idx in range(start_page, end_page):
+        image = render_page(pdf, page_idx, dpi=dpi)
+        page_pdf = image_to_searchable_pdf_page(image, lang=lang)
+        block_page_pdfs.append(page_pdf)
 
-        images = render_pdf_pages(pdf_bytes, dpi=dpi, grayscale=True)
-        page_pdfs: List[bytes] = []
+        pct = int(((page_idx + 1) / total_pages) * 100)
+        progress_bar.progress(
+            pct,
+            text=f"Procesando página {page_idx + 1}/{total_pages}"
+        )
+        status_box.info(
+            f"Bloque actual: páginas {start_page + 1}-{end_page} | "
+            f"Página {page_idx + 1} de {total_pages}"
+        )
 
-        for i, image in enumerate(images, start=1):
-            page_pdf = image_to_searchable_pdf_page(image, lang=lang)
-            page_pdfs.append(page_pdf)
+    return merge_pdf_bytes_list(block_page_pdfs)
 
-            percent = int(((i / total_pages) * 100))
-            progress_bar.progress(percent, text=f"Procesando página {i}/{total_pages} con DPI {dpi}")
 
-        merged_pdf = merge_pdf_pages(page_pdfs)
-        merged_size = len(merged_pdf)
+def process_large_pdf_in_blocks(
+    pdf_bytes: bytes,
+    lang: str,
+    dpi: int,
+    block_size: int,
+    progress_bar,
+    status_box,
+) -> bytes:
+    total_pages = get_page_count(pdf_bytes)
+    merged_blocks: List[bytes] = []
 
-        if best_size is None or merged_size < best_size:
-            best_pdf = merged_pdf
-            best_size = merged_size
-            best_dpi = dpi
+    for block_start in range(0, total_pages, block_size):
+        block_end = min(block_start + block_size, total_pages)
 
-        if merged_size <= MAX_FILE_BYTES:
-            status_box.success(
-                f"Listo. PDF OCR generado con DPI {dpi} y tamaño "
-                f"{merged_size / (1024 * 1024):.2f} MB."
-            )
-            return merged_pdf, dpi
+        block_pdf = process_block(
+            pdf_bytes=pdf_bytes,
+            start_page=block_start,
+            end_page=block_end,
+            dpi=dpi,
+            lang=lang,
+            total_pages=total_pages,
+            progress_bar=progress_bar,
+            status_box=status_box,
+        )
+        merged_blocks.append(block_pdf)
 
-    status_box.warning(
-        "No se pudo dejar bajo 25 MB sin bajar más la calidad. "
-        f"Se entrega la versión más liviana encontrada (DPI {best_dpi}, "
-        f"{best_size / (1024 * 1024):.2f} MB)."
-    )
-    return best_pdf, best_dpi
+    status_box.info("Uniendo bloques finales...")
+    final_pdf = merge_pdf_bytes_list(merged_blocks)
+    progress_bar.progress(100, text="Proceso terminado")
+    return final_pdf
 
 
 def main():
-    st.title("📄 PDF OCR robusto")
-    st.write("Sube un PDF y genera un PDF OCR searchable intentando mantenerlo bajo 25 MB.")
+    st.title("📄 PDF OCR robusto por bloques")
+    st.write("Sube un PDF y genera un PDF OCR searchable por partes, pensado para archivos grandes.")
 
     ok, msg = check_tesseract()
-    if ok:
-        st.success(msg)
-    else:
+    if not ok:
         st.error(msg)
         st.stop()
+    st.success(msg)
 
     langs = available_languages()
-    default_lang = "spa" if "spa" in langs else ("eng" if "eng" in langs else None)
-
-    if default_lang is None:
-        st.error("No hay idiomas OCR disponibles en Tesseract.")
-        st.stop()
-
     lang_options = []
+
+    if "spa" in langs and "eng" in langs:
+        lang_options.append("spa+eng")
     if "spa" in langs:
         lang_options.append("spa")
     if "eng" in langs:
         lang_options.append("eng")
-    if "spa" in langs and "eng" in langs:
-        lang_options.insert(0, "spa+eng")
 
-    selected_lang = st.selectbox("Idioma OCR", options=lang_options, index=0)
+    if not lang_options:
+        st.error("No hay idiomas OCR disponibles.")
+        st.stop()
 
-    compact_mode = st.checkbox("Modo compacto (prioriza quedar bajo 25 MB)", value=True)
+    selected_lang = st.selectbox("Idioma OCR", lang_options, index=0)
+
+    dpi = st.selectbox("Calidad / DPI", [100, 120, 140, 150], index=1)
+    block_size = st.slider("Páginas por bloque", min_value=5, max_value=MAX_BLOCK_SIZE, value=DEFAULT_BLOCK_SIZE, step=5)
 
     uploaded_file = st.file_uploader("Sube tu PDF", type=["pdf"])
 
@@ -189,19 +168,14 @@ def main():
         st.info("Esperando archivo PDF.")
         return
 
-    file_size = uploaded_file.size
-    st.write(f"**Archivo:** {uploaded_file.name}")
-    st.write(f"**Tamaño original:** {file_size / (1024 * 1024):.2f} MB")
-
-    if file_size > MAX_FILE_BYTES:
-        st.error("El PDF de entrada supera 25 MB. Reduce el archivo antes de subirlo.")
-        return
-
     pdf_bytes = uploaded_file.read()
+    input_size_mb = len(pdf_bytes) / (1024 * 1024)
+
+    st.write(f"**Archivo:** {uploaded_file.name}")
+    st.write(f"**Tamaño original:** {input_size_mb:.2f} MB")
 
     try:
-        pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes))
-        total_pages = len(pdf)
+        total_pages = get_page_count(pdf_bytes)
         st.write(f"**Páginas detectadas:** {total_pages}")
     except Exception as e:
         st.error(f"No se pudo leer el PDF: {e}")
@@ -211,37 +185,38 @@ def main():
         st.error("El PDF no contiene páginas.")
         return
 
-    if total_pages > MAX_PAGES:
-        st.error(f"El PDF tiene {total_pages} páginas. Máximo permitido: {MAX_PAGES}.")
-        return
+    if total_pages > 1000:
+        st.warning(
+            f"El PDF tiene {total_pages} páginas. Se intentará procesar por bloques, "
+            "pero puede tardar bastante en Streamlit Cloud."
+        )
 
     if st.button("Procesar OCR"):
-        progress_bar = st.progress(0, text="Iniciando...")
+        progress_bar = st.progress(0, text="Iniciando proceso...")
         status_box = st.empty()
 
         try:
-            dpi_candidates = DPI_CANDIDATES_COMPACT if compact_mode else DPI_CANDIDATES_NORMAL
-
-            output_pdf, used_dpi = build_searchable_pdf(
+            output_pdf = process_large_pdf_in_blocks(
                 pdf_bytes=pdf_bytes,
                 lang=selected_lang,
-                dpi_candidates=dpi_candidates,
+                dpi=dpi,
+                block_size=block_size,
                 progress_bar=progress_bar,
                 status_box=status_box,
             )
 
             output_size_mb = len(output_pdf) / (1024 * 1024)
-            progress_bar.progress(100, text="Proceso finalizado")
-
-            st.write(f"**DPI usado:** {used_dpi}")
             st.write(f"**Tamaño final:** {output_size_mb:.2f} MB")
 
             if len(output_pdf) <= MAX_FILE_BYTES:
                 st.success("El archivo final quedó dentro del límite de 25 MB.")
             else:
-                st.warning("El archivo final quedó sobre 25 MB, pero se entrega la versión más liviana posible.")
+                st.warning(
+                    f"El archivo final quedó en {output_size_mb:.2f} MB. "
+                    "Para bajarlo más, usa un DPI menor o bloques más pequeños."
+                )
 
-            out_name = uploaded_file.name.rsplit(".", 1)[0] + "_ocr.pdf"
+            out_name = uploaded_file.name.rsplit(".", 1)[0] + "_ocr_bloques.pdf"
 
             st.download_button(
                 label="Descargar PDF OCR",
@@ -251,7 +226,7 @@ def main():
             )
 
         except Exception as e:
-            st.error(f"Error procesando OCR: {e}")
+            st.error(f"Error procesando el PDF: {e}")
 
 
 if __name__ == "__main__":
