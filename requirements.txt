@@ -3,3 +3,4 @@ pytesseract
 pypdfium2
 Pillow
 pypdf
+python-docx
